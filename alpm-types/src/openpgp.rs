@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use winnow::{
     ModalResult,
     Parser,
-    combinator::{cut_err, eof, seq},
+    combinator::{alt, cut_err, delimited, eof, fail, opt, peek, seq, terminated},
     error::{StrContext, StrContextValue},
-    token::take_till,
+    token::{rest, take_till},
 };
 
 use crate::Error;
@@ -416,12 +416,12 @@ impl Display for Base64OpenPGPSignature {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Packager {
     name: String,
-    email: EmailAddress,
+    email: Option<EmailAddress>,
 }
 
 impl Packager {
     /// Create a new Packager
-    pub fn new(name: String, email: EmailAddress) -> Packager {
+    pub fn new(name: String, email: Option<EmailAddress>) -> Packager {
         Packager { name, email }
     }
 
@@ -431,8 +431,8 @@ impl Packager {
     }
 
     /// Return the email of the Packager
-    pub fn email(&self) -> &EmailAddress {
-        &self.email
+    pub fn email(&self) -> Option<&EmailAddress> {
+        self.email.as_ref()
     }
 
     /// Parses a [`Packager`] from a string slice.
@@ -447,24 +447,45 @@ impl Packager {
     ///
     /// Returns an error if `input` does not represent a valid [`Packager`].
     pub fn parser(input: &mut &str) -> ModalResult<Self> {
-        seq!(Self {
-            // The name that precedes the email address
-            name: cut_err(take_till(1.., '<'))
-                .map(|s: &str| s.trim().to_string())
-                .context(StrContext::Label("packager name")),
-            // The '<' delimiter that marks the start of the email string
-            _: cut_err('<').context(StrContext::Label("or missing opening delimiter '<' for email address")),
-            // The email address, which is validated by the EmailAddress struct.
-            email: cut_err(
-                take_till(1.., '>')
-                    .try_map(EmailAddress::from_str))
-                    .context(StrContext::Label("Email address")
-                ),
-            // The '>' delimiter that marks the end of the email string
-            _: cut_err('>').context(StrContext::Label("or missing closing delimiter '>' for email address")),
-            _: eof.context(StrContext::Expected(StrContextValue::Description("end of packager string"))),
-        })
-        .parse_next(input)
+        let (name, email) = seq!((
+            // Parse name: everything before '<' or rest of string (but not starting with '<')
+            cut_err(
+                alt((
+                    terminated(take_till(1.., '<'), peek('<')),
+                    rest.verify(|s: &str| !s.trim_start().starts_with('<')),
+                ))
+            )
+            .verify(|s: &str| !s.trim().is_empty())
+            .map(|s: &str| s.trim().to_string())
+            .context(StrContext::Label("packager name")),
+
+            // Parse optional email wrapped in '<' and '>'
+            opt(delimited(
+                '<',
+                cut_err(take_till(1.., '>').try_map(EmailAddress::from_str))
+                    .context(StrContext::Label("Email address")),
+                cut_err('>').context(StrContext::Label(
+                    "or missing closing delimiter '>' for email address",
+                )),
+            )),
+
+            // Ensure end of input
+            _: eof.context(StrContext::Expected(StrContextValue::Description(
+                "end of packager string",
+            ))),
+        ))
+        .parse_next(input)?;
+
+        // Validate: if name contains '@', email is required
+        if name.contains('@') && email.is_none() {
+            return fail
+                .context(StrContext::Label(
+                    "or missing opening delimiter '<' for email address",
+                ))
+                .parse_next(input);
+        }
+
+        Ok(Self { name, email })
     }
 }
 
@@ -478,7 +499,10 @@ impl FromStr for Packager {
 
 impl Display for Packager {
     fn fmt(&self, fmt: &mut Formatter) -> std::fmt::Result {
-        write!(fmt, "{} <{}>", self.name, self.email)
+        match &self.email {
+            Some(email) => write!(fmt, "{} <{}>", self.name, email),
+            None => write!(fmt, "{}", self.name),
+        }
     }
 }
 
@@ -622,14 +646,14 @@ mod tests {
         "Foobar McFooface (The Third) <foobar@mcfooface.org>",
         Packager{
             name: "Foobar McFooface (The Third)".to_string(),
-            email: EmailAddress::from_str("foobar@mcfooface.org").unwrap()
+            email: Some(EmailAddress::from_str("foobar@mcfooface.org").unwrap())
         }
     )]
     #[case(
         "Foobar McFooface <foobar@mcfooface.org>",
         Packager{
             name: "Foobar McFooface".to_string(),
-            email: EmailAddress::from_str("foobar@mcfooface.org").unwrap()
+            email: Some(EmailAddress::from_str("foobar@mcfooface.org").unwrap())
         }
     )]
     fn valid_packager(#[case] from_str: &str, #[case] packager: Packager) {
@@ -641,10 +665,6 @@ mod tests {
     #[case::no_name("<foobar@mcfooface.org>", "invalid packager name")]
     #[case::no_name_and_address_not_wrapped(
         "foobar@mcfooface.org",
-        "invalid or missing opening delimiter '<' for email address"
-    )]
-    #[case::no_wrapped_address(
-        "Foobar McFooface",
         "invalid or missing opening delimiter '<' for email address"
     )]
     #[case::two_wrapped_addresses(
@@ -666,10 +686,34 @@ mod tests {
         Ok(())
     }
 
+    /// Test that packager strings without email are valid when properly formatted
+    #[rstest]
+    #[case(
+        "Foobar McFooface",
+        Packager{
+            name: "Foobar McFooface".to_string(),
+            email: None
+        }
+    )]
+    #[case(
+        "Foobar McFooface (The Third)",
+        Packager{
+            name: "Foobar McFooface (The Third)".to_string(),
+            email: None
+        }
+    )]
+    fn valid_packager_without_email(#[case] from_str: &str, #[case] packager: Packager) {
+        assert_eq!(Packager::from_str(from_str), Ok(packager));
+    }
+
     #[rstest]
     #[case(
         Packager::from_str("Foobar McFooface <foobar@mcfooface.org>").unwrap(),
         "Foobar McFooface <foobar@mcfooface.org>"
+    )]
+    #[case(
+        Packager::from_str("Foobar McFooface").unwrap(),
+        "Foobar McFooface"
     )]
     fn packager_format_string(#[case] packager: Packager, #[case] packager_str: &str) {
         assert_eq!(packager_str, format!("{packager}"));
@@ -677,6 +721,7 @@ mod tests {
 
     #[rstest]
     #[case(Packager::from_str("Foobar McFooface <foobar@mcfooface.org>").unwrap(), "Foobar McFooface")]
+    #[case(Packager::from_str("Foobar McFooface").unwrap(), "Foobar McFooface")]
     fn packager_name(#[case] packager: Packager, #[case] name: &str) {
         assert_eq!(name, packager.name());
     }
@@ -687,6 +732,12 @@ mod tests {
         &EmailAddress::from_str("foobar@mcfooface.org").unwrap(),
     )]
     fn packager_email(#[case] packager: Packager, #[case] email: &EmailAddress) {
-        assert_eq!(email, packager.email());
+        assert_eq!(email, packager.email().unwrap());
+    }
+
+    #[rstest]
+    #[case(Packager::from_str("Foobar McFooface").unwrap())]
+    fn packager_email_none(#[case] packager: Packager) {
+        assert_eq!(None, packager.email());
     }
 }
